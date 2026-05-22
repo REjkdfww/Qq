@@ -8,6 +8,7 @@
 #include <cmath>
 #include <filesystem>
 #include <sstream>
+#include <queue>
 
 using namespace std;
 namespace fs = filesystem;
@@ -35,24 +36,20 @@ string normalizeText(const string& text) {
     for (char c : text) {
         char lower = tolower((unsigned char)c);
         
-        // ё -> е
         if (lower == 'ё') {
             lower = 'е';
         }
         
-        // Russian letter
         if ((lower >= 'а' && lower <= 'я')) {
             result += lower;
             lastWasSpace = false;
         }
-        // Space
         else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             if (!lastWasSpace && !result.empty()) {
                 result += ' ';
                 lastWasSpace = true;
             }
         }
-        // Any other character (punctuation) -> dot
         else {
             if (!lastWasSpace && !result.empty()) {
                 result += '.';
@@ -61,7 +58,6 @@ string normalizeText(const string& text) {
         }
     }
     
-    // Remove trailing space or dot
     while (!result.empty() && (result.back() == ' ' || result.back() == '.')) {
         result.pop_back();
     }
@@ -94,8 +90,8 @@ string indicesToText(const vector<int>& indices) {
 // 5-gram model
 struct NGramModel {
     map<vector<int>, map<int, double>> transitions; // [i1,i2,i3,i4] -> {i5 -> probability}
-    map<vector<int>, double> contextCounts;          // context frequencies
-    map<int, double> unigramProb;                    // character probabilities
+    map<vector<int>, double> contextCounts;
+    map<int, double> unigramProb;
     double epsilon;
     int totalContexts;
     
@@ -150,7 +146,6 @@ NGramModel mergeModels(vector<NGramModel>& models) {
     
     if (models.empty()) return merged;
     
-    // Average transitions from all models
     map<vector<int>, map<int, double>> allTransitions;
     
     for (auto& model : models) {
@@ -162,7 +157,6 @@ NGramModel mergeModels(vector<NGramModel>& models) {
         }
     }
     
-    // Normalize by number of models
     for (auto& ctx : allTransitions) {
         for (auto& p : ctx.second) {
             p.second /= models.size();
@@ -170,7 +164,6 @@ NGramModel mergeModels(vector<NGramModel>& models) {
         merged.transitions[ctx.first] = ctx.second;
     }
     
-    // Average unigrams
     for (auto& model : models) {
         for (auto& p : model.unigramProb) {
             merged.unigramProb[p.first] += p.second;
@@ -195,11 +188,10 @@ NGramModel loadTrainingData() {
         if (entry.is_regular_file() && entry.path().extension() == ".txt") {
             string filename = entry.path().filename().string();
             
-            // Skip ciphertext files (they contain "cipher" in name)
             if (filename.find("cipher") != string::npos || 
                 filename.find("шифр") != string::npos ||
                 filename.find("decoded") != string::npos ||
-                filename == "posd_decoder.cpp") {
+                filename.find("gamma") != string::npos) {
                 continue;
             }
             
@@ -209,7 +201,6 @@ NGramModel loadTrainingData() {
                 continue;
             }
             
-            // Read file
             stringstream buffer;
             buffer << file.rdbuf();
             file.close();
@@ -240,7 +231,7 @@ NGramModel loadTrainingData() {
     return finalModel;
 }
 
-// Get probability of next character given context
+// Get probability of character given context
 double getTransitionProb(const NGramModel& model, const vector<int>& context, int nextChar) {
     if (model.transitions.find(context) != model.transitions.end()) {
         auto& probs = model.transitions.at(context);
@@ -249,7 +240,6 @@ double getTransitionProb(const NGramModel& model, const vector<int>& context, in
         }
     }
     
-    // Backoff to unigram probability
     if (model.unigramProb.find(nextChar) != model.unigramProb.end()) {
         return model.unigramProb.at(nextChar) * 0.1;
     }
@@ -257,68 +247,243 @@ double getTransitionProb(const NGramModel& model, const vector<int>& context, in
     return model.epsilon;
 }
 
-// PosD Algorithm 3: Sequential Decoding
-vector<int> decodePosD(const vector<int>& received, const NGramModel& model) {
-    int n = received.size();
-    vector<int> decoded;
-    
-    if (n < 4) {
-        return received;
+// Get unigram probability
+double getUnigramProb(const NGramModel& model, int ch) {
+    if (model.unigramProb.find(ch) != model.unigramProb.end()) {
+        return model.unigramProb.at(ch);
     }
-    
-    // 1.1 Initialization: set first 4 characters
-    for (int i = 0; i < 4; i++) {
-        decoded.push_back(received[i]);
-    }
-    
-    // 2. Recursive step: for each position t = 4, 5, ..., n-1
-    for (int t = 4; t < n; t++) {
-        vector<int> context = {decoded[t-4], decoded[t-3], decoded[t-2], decoded[t-1]};
-        
-        // Find best next character
-        int bestChar = received[t];
-        double maxProb = getTransitionProb(model, context, received[t]);
-        
-        // Try all characters in alphabet
-        for (int c = 0; c < ALPHABET_SIZE; c++) {
-            double prob = getTransitionProb(model, context, c);
-            if (prob > maxProb) {
-                maxProb = prob;
-                bestChar = c;
-            }
-        }
-        
-        decoded.push_back(bestChar);
-    }
-    
-    return decoded;
+    return model.epsilon;
 }
 
-// Load ciphertext from file
-vector<int> loadCiphertext(const string& filename) {
-    ifstream file(filename, ios::binary);
-    if (!file.is_open()) {
-        cerr << "Cannot open ciphertext file: " << filename << "\n";
+// Candidate path: gamma prefix + log-likelihood
+struct GammaPath {
+    vector<int> gamma;
+    double logL;
+    
+    bool operator<(const GammaPath& other) const {
+        return logL < other.logL;  // for priority queue (max heap)
+    }
+};
+
+// PosD Algorithm: Recover gamma from multiple ciphertexts
+vector<int> decodePosD(
+    const vector<vector<int>>& ciphers,
+    const NGramModel& model,
+    double epsilon = 0.01
+) {
+    int K = ciphers.size();  // number of ciphertexts
+    if (K == 0) {
+        cerr << "No ciphertexts provided\n";
         return vector<int>();
     }
     
-    stringstream buffer;
-    buffer << file.rdbuf();
-    file.close();
+    int N = ciphers[0].size();  // length of texts
     
-    string text = buffer.str();
-    text = normalizeText(text);
+    cout << "PosD: K=" << K << " ciphertexts, N=" << N << " symbols\n";
+    cout << "Epsilon threshold: " << epsilon << "\n\n";
     
-    cout << "Loaded ciphertext: " << filename << " (" << text.length() << " chars)\n";
-    cout << "First 100 chars: " << text.substr(0, min((size_t)100, text.length())) << "\n\n";
+    // ===== STEP 1: Initialize with all 34^4 possibilities for first 4 gamma symbols =====
+    cout << "Step 1: Initializing first 4 gamma symbols...\n";
     
-    return textToIndices(text);
+    priority_queue<GammaPath> buffer;
+    int initCount = 0;
+    
+    for (int g0 = 0; g0 < ALPHABET_SIZE; g0++) {
+        for (int g1 = 0; g1 < ALPHABET_SIZE; g1++) {
+            for (int g2 = 0; g2 < ALPHABET_SIZE; g2++) {
+                for (int g3 = 0; g3 < ALPHABET_SIZE; g3++) {
+                    vector<int> gammaPrefix = {g0, g1, g2, g3};
+                    double logL = 0.0;
+                    
+                    // For each ciphertext
+                    for (int j = 0; j < K; j++) {
+                        // Decrypt first 4 symbols
+                        vector<int> plain;
+                        for (int t = 0; t < 4; t++) {
+                            int pt = (ciphers[j][t] - gammaPrefix[t] + ALPHABET_SIZE) % ALPHABET_SIZE;
+                            plain.push_back(pt);
+                        }
+                        
+                        // Probability of this 4-gram in the language
+                        vector<int> ctx;
+                        logL += log(getUnigramProb(model, plain[0]));
+                        logL += log(getUnigramProb(model, plain[1]));
+                        logL += log(getUnigramProb(model, plain[2]));
+                        logL += log(getUnigramProb(model, plain[3]));
+                    }
+                    
+                    // Add to buffer
+                    GammaPath path;
+                    path.gamma = gammaPrefix;
+                    path.logL = logL;
+                    buffer.push(path);
+                    
+                    initCount++;
+                    if (initCount % 100000 == 0) {
+                        cout << "  Processed " << initCount << " / " << (ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE * ALPHABET_SIZE) << "\n";
+                    }
+                }
+            }
+        }
+    }
+    
+    cout << "  Initial candidates: " << buffer.size() << "\n";
+    
+    // Normalize and keep top candidates (confidence level 1-epsilon)
+    double maxLogL = buffer.top().logL;
+    double threshold = maxLogL - fabs(log(epsilon));
+    
+    priority_queue<GammaPath> newBuffer;
+    while (!buffer.empty()) {
+        GammaPath p = buffer.top();
+        buffer.pop();
+        if (p.logL >= threshold) {
+            newBuffer.push(p);
+        }
+    }
+    buffer = newBuffer;
+    
+    cout << "  After filtering: " << buffer.size() << " candidates\n\n";
+    
+    // ===== STEP 2: Recursive extension for t=4..N-1 =====
+    cout << "Step 2: Recursive extension...\n";
+    
+    for (int t = 4; t < N; t++) {
+        if (t % 10 == 0) {
+            cout << "  Processing position t=" << t << ", buffer size=" << buffer.size() << "\n";
+        }
+        
+        priority_queue<GammaPath> newBuffer;
+        
+        // For each current candidate path
+        while (!buffer.empty()) {
+            GammaPath path = buffer.top();
+            buffer.pop();
+            
+            // Try all 34 possibilities for gamma[t]
+            for (int gt = 0; gt < ALPHABET_SIZE; gt++) {
+                double newLogL = path.logL;
+                
+                // For each ciphertext
+                for (int j = 0; j < K; j++) {
+                    // Decrypt symbol at position t
+                    int pt = (ciphers[j][t] - gt + ALPHABET_SIZE) % ALPHABET_SIZE;
+                    
+                    // Get context (previous 4 plaintext symbols)
+                    vector<int> context;
+                    for (int i = 4; i > 0; i--) {
+                        int prev_ct = (ciphers[j][t-i] - path.gamma[(t-i) % path.gamma.size()] + ALPHABET_SIZE) % ALPHABET_SIZE;
+                        context.push_back(prev_ct);
+                    }
+                    
+                    // P(p_t | context)
+                    double prob = getTransitionProb(model, context, pt);
+                    newLogL += log(prob);
+                }
+                
+                // Create new path
+                GammaPath newPath;
+                newPath.gamma = path.gamma;
+                newPath.gamma.push_back(gt);
+                newPath.logL = newLogL;
+                
+                newBuffer.push(newPath);
+            }
+        }
+        
+        buffer = newBuffer;
+        
+        // Normalize and keep top candidates
+        double maxLogL = buffer.top().logL;
+        double threshold = maxLogL - fabs(log(epsilon));
+        
+        priority_queue<GammaPath> filteredBuffer;
+        while (!buffer.empty()) {
+            GammaPath p = buffer.top();
+            buffer.pop();
+            if (p.logL >= threshold) {
+                filteredBuffer.push(p);
+            }
+        }
+        buffer = filteredBuffer;
+        
+        // Check if all candidates have common prefix gamma
+        if (buffer.size() >= 1) {
+            vector<int> commonGamma;
+            bool foundCommon = true;
+            
+            auto it = buffer._Get_container().begin();
+            if (it != buffer._Get_container().end()) {
+                vector<int> firstGamma = it->gamma;
+                
+                for (size_t i = 0; i < firstGamma.size(); i++) {
+                    bool allSame = true;
+                    int val = firstGamma[i];
+                    
+                    for (auto& p : buffer._Get_container()) {
+                        if (i >= p.gamma.size() || p.gamma[i] != val) {
+                            allSame = false;
+                            break;
+                        }
+                    }
+                    
+                    if (allSame) {
+                        commonGamma.push_back(val);
+                    } else {
+                        foundCommon = false;
+                        break;
+                    }
+                }
+                
+                if (foundCommon && commonGamma.size() > 4) {
+                    cout << "  Common prefix found at t=" << t << ": " << commonGamma.size() << " symbols\n";
+                }
+            }
+        }
+    }
+    
+    // Return best gamma candidate
+    if (!buffer.empty()) {
+        GammaPath best = buffer.top();
+        cout << "\nBest gamma found, length: " << best.gamma.size() << "\n";
+        cout << "Log-likelihood: " << best.logL << "\n";
+        return best.gamma;
+    }
+    
+    return vector<int>();
+}
+
+// Load ciphertext files
+vector<vector<int>> loadCiphertexts(const vector<string>& filenames) {
+    vector<vector<int>> ciphers;
+    
+    for (const string& filename : filenames) {
+        ifstream file(filename, ios::binary);
+        if (!file.is_open()) {
+            cerr << "Cannot open ciphertext file: " << filename << "\n";
+            continue;
+        }
+        
+        stringstream buffer;
+        buffer << file.rdbuf();
+        file.close();
+        
+        string text = buffer.str();
+        text = normalizeText(text);
+        
+        cout << "Loaded ciphertext: " << filename << " (" << text.length() << " chars)\n";
+        cout << "First 50 chars: " << text.substr(0, min((size_t)50, text.length())) << "\n\n";
+        
+        ciphers.push_back(textToIndices(text));
+    }
+    
+    return ciphers;
 }
 
 int main() {
     initAlphabet();
     
-    cout << "=== PosD Algorithm 3: Sequential Decoding ===\n";
+    cout << "=== PosD Algorithm: Gamma Recovery ===\n";
     cout << "Russian Language 5-gram Model\n";
     cout << "Alphabet size: " << ALPHABET_SIZE << "\n\n";
     
@@ -330,62 +495,83 @@ int main() {
         return 1;
     }
     
-    // Main decoding loop for multiple ciphertexts
-    int ciphertextCount = 0;
+    // Main loop for decoding
     while (true) {
-        cout << "=== Ciphertext #" << (ciphertextCount + 1) << " ===\n";
-        cout << "Enter ciphertext filename (or 'exit' to quit): ";
+        cout << "=== Gamma Recovery ===\n";
+        cout << "Enter number of ciphertexts (or 0 to exit): ";
         
-        string filename;
-        getline(cin, filename);
+        int K;
+        cin >> K;
+        cin.ignore();
         
-        if (filename == "exit" || filename == "выход") {
+        if (K <= 0) {
             break;
         }
         
-        if (filename.empty()) {
-            cout << "Filename cannot be empty.\n\n";
-            continue;
-        }
-        
-        // Add .txt if not present
-        if (filename.find(".txt") == string::npos) {
-            filename += ".txt";
-        }
-        
-        vector<int> ciphertextIndices = loadCiphertext(filename);
-        
-        if (ciphertextIndices.empty()) {
-            cout << "Failed to load ciphertext.\n\n";
-            continue;
-        }
-        
-        // Decode
-        cout << "Decoding using PosD Algorithm...\n";
-        vector<int> decodedIndices = decodePosD(ciphertextIndices, model);
-        string decodedText = indicesToText(decodedIndices);
-        
-        cout << "\nDecoded text:\n";
-        cout << decodedText << "\n\n";
-        
-        // Option to save result
-        cout << "Save result? (y/n): ";
-        string save;
-        getline(cin, save);
-        
-        if (save == "y" || save == "Y" || save == "да") {
-            string outputFilename = filename.substr(0, filename.find(".txt")) + "_decoded.txt";
-            ofstream outFile(outputFilename);
-            outFile << decodedText;
-            outFile.close();
-            cout << "Saved to: " << outputFilename << "\n";
+        vector<string> filenames;
+        for (int i = 0; i < K; i++) {
+            cout << "Enter ciphertext filename " << (i+1) << ": ";
+            string filename;
+            getline(cin, filename);
+            
+            if (filename.find(".txt") == string::npos) {
+                filename += ".txt";
+            }
+            
+            filenames.push_back(filename);
         }
         
         cout << "\n";
-        ciphertextCount++;
+        vector<vector<int>> ciphers = loadCiphertexts(filenames);
+        
+        if (ciphers.size() != (size_t)K || ciphers.empty()) {
+            cout << "Failed to load ciphertexts.\n\n";
+            continue;
+        }
+        
+        // Check all same length
+        bool sameLength = true;
+        size_t len = ciphers[0].size();
+        for (auto& c : ciphers) {
+            if (c.size() != len) {
+                sameLength = false;
+                break;
+            }
+        }
+        
+        if (!sameLength) {
+            cerr << "All ciphertexts must have the same length!\n\n";
+            continue;
+        }
+        
+        // Recover gamma
+        cout << "Recovering gamma using PosD...\n\n";
+        vector<int> gamma = decodePosD(ciphers, model, 0.01);
+        
+        if (gamma.empty()) {
+            cout << "Failed to recover gamma.\n\n";
+            continue;
+        }
+        
+        string gammaText = indicesToText(gamma);
+        cout << "\n=== RECOVERED GAMMA ===\n";
+        cout << gammaText << "\n\n";
+        
+        // Decrypt all ciphertexts using recovered gamma
+        cout << "=== DECRYPTED TEXTS ===\n";
+        for (size_t j = 0; j < ciphers.size(); j++) {
+            cout << "\nPlaintext " << (j+1) << ":\n";
+            string plaintext = "";
+            for (size_t t = 0; t < ciphers[j].size(); t++) {
+                int pt = (ciphers[j][t] - gamma[t % gamma.size()] + ALPHABET_SIZE) % ALPHABET_SIZE;
+                plaintext += indexToChar(pt);
+            }
+            cout << plaintext << "\n";
+        }
+        
+        cout << "\n";
     }
     
-    cout << "Total ciphertexts decoded: " << ciphertextCount << "\n";
     cout << "Program finished.\n";
     
     return 0;
